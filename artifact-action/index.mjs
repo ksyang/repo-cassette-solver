@@ -117,3 +117,37 @@ for (const [label, fields] of cases) {
   }
 }
 console.log(`WIRE_REPORT ${JSON.stringify(report)}`);
+
+const mutationCases = [
+  ['missing', '"version":7'],
+  ['null', '"version":7,"mime_type":null'],
+  ['invalid', `"version":7,"mime_type":${quoted(weird)}`],
+  ['valid', '"version":7,"mime_type":"application/json"'],
+  ['version-eight', '"version":8,"mime_type":"application/json"'],
+];
+for (const [label, fields] of mutationCases) {
+  const name = `mutate-${process.env.GITHUB_RUN_ID}-${label}`;
+  try {
+    const original = await client.CreateArtifact({
+      workflowRunBackendId: ids.workflowRunBackendId,
+      workflowJobRunBackendId: ids.workflowJobRunBackendId,
+      name,
+      version: 6,
+      mimeType: StringValue.create({value: weird}),
+    });
+    const mutation = await rawCreate(name, fields);
+    const artifactId = await publish(name, original.signedUploadUrl);
+    console.log(`MUTATION ${JSON.stringify({
+      label,
+      mutationStatus: mutation.status,
+      mutationOk: mutation.ok,
+      mutationResponse: mutation.text.slice(0, 180),
+      originalPath: new URL(original.signedUploadUrl).pathname.split('.').at(-1),
+      mutationPath: mutation.signedUploadUrl
+        ? new URL(mutation.signedUploadUrl).pathname.split('.').at(-1) : null,
+      artifactId,
+    })}`);
+  } catch (error) {
+    console.log(`MUTATION ${JSON.stringify({label, error: String(error).slice(0, 300)})}`);
+  }
+}
