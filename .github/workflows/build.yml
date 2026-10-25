@@ -1,6 +1,7 @@
 name: Build Repo Cassette artifacts
 
 on:
+  push:
   workflow_dispatch:
 
 jobs:
