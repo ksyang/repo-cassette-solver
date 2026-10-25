@@ -88,6 +88,14 @@ const cases = [
   ['null', null], ['false', false],
   ['v7-control', 7, 'application/json'],
   ['v8-control', 8, 'application/json'],
+  ['fs-suffix', 7, 'application/json\u001c'],
+  ['gs-suffix', 7, 'application/json\u001d'],
+  ['rs-suffix', 7, 'application/json\u001e'],
+  ['us-suffix', 7, 'application/json\u001f'],
+  ['fs-prefix', 7, '\u001capplication/json'],
+  ['gs-prefix', 7, '\u001dapplication/json'],
+  ['rs-prefix', 7, '\u001eapplication/json'],
+  ['us-prefix', 7, '\u001fapplication/json'],
 ];
 
 for (let i = 0; i < cases.length; i += 6) {
